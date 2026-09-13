@@ -54,7 +54,12 @@ jobs:
           echo "Using CC: $CC"
           "$CC" -v 2>&1 | tail -3 || true
 
-      - name: Build (no TLS)
+      - name: Build (no TLS, static)
+        env:
+          # mipsel-unknown-linux-musl defaults to a *dynamic* PIE (its target spec
+          # sets crt_static_default = false), so force static linking to get a
+          # self-contained binary that does not depend on the router's musl.
+          RUSTFLAGS: -C target-feature=+crt-static
         run: |
           set -euxo pipefail
           cargo +nightly build \
@@ -71,10 +76,14 @@ jobs:
           ls -lh "$BIN"
           echo "--- ELF header ---"
           readelf -h "$BIN" | grep -Ei "Class|Data|Machine|Type"
-          echo "--- MIPS ABI flags (FP ABI must be Soft float) ---"
-          readelf -A "$BIN" || true
-          echo "--- dynamic deps (must be none) ---"
-          readelf -d "$BIN" 2>/dev/null || echo "no dynamic section (static)"
+          echo "--- MIPS ABI flags (must be ISA MIPS32r2 / FP ABI Soft float) ---"
+          readelf -A "$BIN"
+          echo "--- dynamic section (must be none) ---"
+          if readelf -d "$BIN" 2>/dev/null | grep -q NEEDED; then
+            echo "ERROR: binary is dynamically linked"
+            exit 1
+          fi
+          echo "static linking OK"
 
       - name: Smoke test under qemu
         run: |
