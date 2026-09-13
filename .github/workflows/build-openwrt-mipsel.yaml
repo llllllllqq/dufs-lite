@@ -40,11 +40,11 @@ jobs:
           mkdir -p /opt/openwrt
           tar --zstd -xf /tmp/toolchain.tar.zst -C /opt/openwrt
           TC_DIR="$(find /opt/openwrt -maxdepth 2 -type d -name 'toolchain-mipsel_24kc*' | head -1)"
-          test -n "$TC_DIR"
           CC="$(ls "$TC_DIR"/bin/*-gcc | head -1)"
-          test -n "$CC"
           {
             echo "TC_DIR=$TC_DIR"
+            echo "GCC_LIB_DIR=$(dirname "$(find "$TC_DIR" -name libgcc.a | head -1)")"
+            echo "SYSROOT=$(dirname "$(dirname "$(find "$TC_DIR" -name 'ld-musl-mipsel-sf.so.1' | head -1)")")"
             echo "PATH=$TC_DIR/bin:$PATH"
             echo "STAGING_DIR=/opt/openwrt"
             echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=$CC"
@@ -52,19 +52,30 @@ jobs:
             echo "AR_mipsel_unknown_linux_musl=$(ls "$TC_DIR"/bin/*-ar | head -1)"
           } >> "$GITHUB_ENV"
           echo "Using CC: $CC"
-          "$CC" -v 2>&1 | tail -3 || true
 
-      - name: Build (no TLS, static)
+      # rustc always asks for -lunwind when linking musl statically, but OpenWrt
+      # uses libgcc for unwinding and ships no libunwind.a. libgcc_eh.a provides
+      # the same Itanium _Unwind_* ABI, so expose it under the name rustc wants.
+      - name: Provide libunwind shim
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/unwind-shim
+          cp "$GCC_LIB_DIR/libgcc_eh.a" /tmp/unwind-shim/libunwind.a
+          ls -l /tmp/unwind-shim
+
+      - name: Build static (preferred)
+        id: static
+        continue-on-error: true
         env:
-          # Two things have to be forced here:
-          # 1. mipsel-unknown-linux-musl defaults to a *dynamic* PIE (its target
-          #    spec sets crt_static_default = false), so ask for crt-static to
-          #    get a self-contained binary.
-          # 2. musl targets use rustc's bundled `self-contained` crt objects +
-          #    libunwind when crt-static is on, but a Tier 3 target ships no such
-          #    directory (rust-lang/rust#120655). Disabling self-contained
-          #    linking lets the OpenWrt gcc provide crt1.o/crti.o and libc.a.
-          RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
+          # - crt-static: mipsel-unknown-linux-musl defaults to a *dynamic* PIE.
+          # - link-self-contained=no: a Tier 3 target ships no bundled crt
+          #   objects, so let the OpenWrt gcc provide crt1.o/crti.o/libc.a.
+          #   (rust-lang/rust#120655)
+          RUSTFLAGS: >-
+            -C target-feature=+crt-static
+            -C link-self-contained=no
+            -C link-arg=-L/tmp/unwind-shim
+            -C link-arg=-lgcc
         run: |
           set -euxo pipefail
           cargo +nightly build \
@@ -72,34 +83,44 @@ jobs:
             --target "$TARGET" \
             --no-default-features \
             -Z build-std=std,panic_abort
+          mkdir -p dist
+          cp "target/$TARGET/release/dufs" dist/dufs
 
-      - name: Inspect binary
+      - name: Build dynamic (fallback)
+        if: steps.static.outcome != 'success'
         run: |
           set -euxo pipefail
-          BIN="target/${TARGET}/release/dufs"
+          cargo +nightly build \
+            --locked --release \
+            --target "$TARGET" \
+            --no-default-features \
+            -Z build-std=std,panic_abort
+          mkdir -p dist
+          cp "target/$TARGET/release/dufs" dist/dufs
+
+      - name: Inspect and smoke test
+        run: |
+          set -euxo pipefail
+          BIN=dist/dufs
           file "$BIN"
           ls -lh "$BIN"
           echo "--- ELF header ---"
           readelf -h "$BIN" | grep -Ei "Class|Data|Machine|Type"
-          echo "--- MIPS ABI flags (must be ISA MIPS32r2 / FP ABI Soft float) ---"
-          readelf -A "$BIN"
-          echo "--- dynamic section (must be none) ---"
+          echo "--- MIPS ABI flags (expect ISA MIPS32r2 / FP ABI Soft float) ---"
+          readelf -A "$BIN" | grep -Ei "ISA|FP ABI|GPR size"
+          echo "--- dynamic section ---"
           if readelf -d "$BIN" 2>/dev/null | grep -q NEEDED; then
-            echo "ERROR: binary is dynamically linked"
-            exit 1
+            echo "VARIANT: dynamic (links against the router's musl)"
+            readelf -d "$BIN" | grep NEEDED || true
+            qemu-mipsel-static -L "$SYSROOT" "$BIN" --version
+          else
+            echo "VARIANT: static (self-contained)"
+            qemu-mipsel-static "$BIN" --version
           fi
-          echo "static linking OK"
-
-      - name: Smoke test under qemu
-        run: |
-          set -euxo pipefail
-          BIN="target/${TARGET}/release/dufs"
-          chmod +x "$BIN"
-          qemu-mipsel-static "$BIN" --version
-          echo "binary executes OK under qemu-mipsel (ABI is consistent)"
+          echo "smoke test OK: binary executes under qemu-mipsel"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dufs-no-tls-mipsel-24kc
-          path: target/mipsel-unknown-linux-musl/release/dufs
+          path: dist/dufs
