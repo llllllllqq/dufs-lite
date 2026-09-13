@@ -119,6 +119,24 @@ jobs:
           fi
           echo "smoke test OK: binary executes under qemu-mipsel"
 
+      - name: End-to-end HTTP test under qemu
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/dufs-e2e
+          echo "hello from mips" > /tmp/dufs-e2e/hello.txt
+          qemu-mipsel-static dist/dufs -p 5099 /tmp/dufs-e2e > /tmp/dufs.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          sleep 3
+          echo "--- server log ---"; cat /tmp/dufs.log
+          echo "--- health ---"
+          curl -fsS "http://127.0.0.1:5099/__dufs__/health"; echo
+          echo "--- dir listing ---"
+          curl -fsS "http://127.0.0.1:5099/?json" | head -c 300; echo
+          echo "--- file fetch ---"
+          curl -fsS "http://127.0.0.1:5099/hello.txt"
+          echo "end-to-end OK: mipsel binary served HTTP requests"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
