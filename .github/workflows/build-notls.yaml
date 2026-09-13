@@ -1,0 +1,36 @@
+name: Build No-TLS ARMv8
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build aarch64-no-tls
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (no TLS)
+        run: cross build --locked --release --target=aarch64-unknown-linux-musl --no-default-features
+
+      - name: Check binary size
+        run: ls -lh target/aarch64-unknown-linux-musl/release/dufs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dufs-no-tls-aarch64
+          path: target/aarch64-unknown-linux-musl/release/dufs
