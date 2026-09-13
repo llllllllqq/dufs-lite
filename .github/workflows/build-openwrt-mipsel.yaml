@@ -1,0 +1,77 @@
+name: Build No-TLS OpenWrt mipsel
+
+on:
+  workflow_dispatch:
+
+env:
+  TARGET: mipsel-unknown-linux-musl
+  TOOLCHAIN_PREFIX: mipsel-linux-muslsf
+  TOOLCHAIN_DIR: /opt/mipsel-linux-muslsf-cross
+
+jobs:
+  build:
+    name: Build mipsel-24kc-no-tls
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # MIPS targets are Tier 3 in Rust: no prebuilt std, so we need
+      # nightly + rust-src to compile std for the target (-Z build-std).
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # MT7620 is a MIPS 24KEc: MIPS32r2, no FPU. Rust's
+      # mipsel-unknown-linux-musl is mips32r2 + soft-float, so we must link
+      # against a soft-float musl (muslsf), not the hard-float one.
+      - name: Install soft-float MIPS musl toolchain
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o /tmp/musl-cross.tgz \
+            "https://musl.cc/${TOOLCHAIN_PREFIX}-cross.tgz"
+          tar -xzf /tmp/musl-cross.tgz -C /opt
+          ls "${TOOLCHAIN_DIR}/bin" | head
+          "${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}-gcc" -v 2>&1 | tail -3
+
+      - name: Configure linker and toolchain
+        run: |
+          set -euxo pipefail
+          {
+            echo "PATH=${TOOLCHAIN_DIR}/bin:${PATH}"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=${TOOLCHAIN_PREFIX}-gcc"
+            echo "CC_mipsel_unknown_linux_musl=${TOOLCHAIN_PREFIX}-gcc"
+            echo "AR_mipsel_unknown_linux_musl=${TOOLCHAIN_PREFIX}-ar"
+            echo "CFLAGS_mipsel_unknown_linux_musl=-msoft-float"
+          } >> "$GITHUB_ENV"
+
+      - name: Build (no TLS)
+        run: |
+          set -euxo pipefail
+          cargo +nightly build \
+            --locked --release \
+            --target "$TARGET" \
+            --no-default-features \
+            -Z build-std=std,panic_abort
+
+      - name: Inspect binary
+        run: |
+          set -euxo pipefail
+          BIN="target/${TARGET}/release/dufs"
+          file "$BIN"
+          ls -lh "$BIN"
+          echo "--- ELF header ---"
+          readelf -h "$BIN" | grep -Ei "Class|Data|Machine|Type"
+          echo "--- MIPS ABI flags (FP ABI must be soft-float) ---"
+          readelf -A "$BIN" || true
+          echo "--- dynamic deps (must be none) ---"
+          readelf -d "$BIN" || echo "no dynamic section (static)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dufs-no-tls-mipsel-24kc
+          path: target/mipsel-unknown-linux-musl/release/dufs
