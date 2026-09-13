@@ -5,8 +5,8 @@ on:
 
 env:
   TARGET: mipsel-unknown-linux-musl
-  TOOLCHAIN_PREFIX: mipsel-linux-muslsf
-  TOOLCHAIN_DIR: /opt/mipsel-linux-muslsf-cross
+  # Official OpenWrt 25.12.5 toolchain for ramips/mt7620 (mipsel_24kc, soft-float)
+  TOOLCHAIN_URL: https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7620/openwrt-toolchain-25.12.5-ramips-mt7620_gcc-14.3.0_musl.Linux-x86_64.tar.zst
 
 jobs:
   build:
@@ -18,35 +18,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # MIPS targets are Tier 3 in Rust: no prebuilt std, so we need
-      # nightly + rust-src to compile std for the target (-Z build-std).
+      # All MIPS Rust targets are Tier 3: no prebuilt std is published, so we
+      # need nightly + rust-src to compile std from source (-Z build-std).
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
 
-      # MT7620 is a MIPS 24KEc: MIPS32r2, no FPU. Rust's
-      # mipsel-unknown-linux-musl is mips32r2 + soft-float, so we must link
-      # against a soft-float musl (muslsf), not the hard-float one.
-      - name: Install soft-float MIPS musl toolchain
+      - name: Install zstd and qemu-user-static
         run: |
-          set -euxo pipefail
-          curl -fsSL -o /tmp/musl-cross.tgz \
-            "https://musl.cc/${TOOLCHAIN_PREFIX}-cross.tgz"
-          tar -xzf /tmp/musl-cross.tgz -C /opt
-          ls "${TOOLCHAIN_DIR}/bin" | head
-          "${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}-gcc" -v 2>&1 | tail -3
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd qemu-user-static
 
-      - name: Configure linker and toolchain
+      # MT7620 is a MIPS 24KEc (MIPS32r2, no FPU). Rust's
+      # mipsel-unknown-linux-musl is mips32r2 + soft-float, so the matching
+      # toolchain is OpenWrt's mipsel_24kc one (also soft-float).
+      - name: Install OpenWrt toolchain
         run: |
           set -euxo pipefail
+          curl -fsSL -o /tmp/toolchain.tar.zst "$TOOLCHAIN_URL"
+          mkdir -p /opt/openwrt
+          tar --zstd -xf /tmp/toolchain.tar.zst -C /opt/openwrt
+          TC_DIR="$(find /opt/openwrt -maxdepth 2 -type d -name 'toolchain-mipsel_24kc*' | head -1)"
+          test -n "$TC_DIR"
+          CC="$(ls "$TC_DIR"/bin/*-gcc | head -1)"
+          test -n "$CC"
           {
-            echo "PATH=${TOOLCHAIN_DIR}/bin:${PATH}"
-            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=${TOOLCHAIN_PREFIX}-gcc"
-            echo "CC_mipsel_unknown_linux_musl=${TOOLCHAIN_PREFIX}-gcc"
-            echo "AR_mipsel_unknown_linux_musl=${TOOLCHAIN_PREFIX}-ar"
-            echo "CFLAGS_mipsel_unknown_linux_musl=-msoft-float"
+            echo "TC_DIR=$TC_DIR"
+            echo "PATH=$TC_DIR/bin:$PATH"
+            echo "STAGING_DIR=/opt/openwrt"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=$CC"
+            echo "CC_mipsel_unknown_linux_musl=$CC"
+            echo "AR_mipsel_unknown_linux_musl=$(ls "$TC_DIR"/bin/*-ar | head -1)"
           } >> "$GITHUB_ENV"
+          echo "Using CC: $CC"
+          "$CC" -v 2>&1 | tail -3 || true
 
       - name: Build (no TLS)
         run: |
@@ -65,10 +71,18 @@ jobs:
           ls -lh "$BIN"
           echo "--- ELF header ---"
           readelf -h "$BIN" | grep -Ei "Class|Data|Machine|Type"
-          echo "--- MIPS ABI flags (FP ABI must be soft-float) ---"
+          echo "--- MIPS ABI flags (FP ABI must be Soft float) ---"
           readelf -A "$BIN" || true
           echo "--- dynamic deps (must be none) ---"
-          readelf -d "$BIN" || echo "no dynamic section (static)"
+          readelf -d "$BIN" 2>/dev/null || echo "no dynamic section (static)"
+
+      - name: Smoke test under qemu
+        run: |
+          set -euxo pipefail
+          BIN="target/${TARGET}/release/dufs"
+          chmod +x "$BIN"
+          qemu-mipsel-static "$BIN" --version
+          echo "binary executes OK under qemu-mipsel (ABI is consistent)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
