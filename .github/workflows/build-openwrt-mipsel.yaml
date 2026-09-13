@@ -56,10 +56,15 @@ jobs:
 
       - name: Build (no TLS, static)
         env:
-          # mipsel-unknown-linux-musl defaults to a *dynamic* PIE (its target spec
-          # sets crt_static_default = false), so force static linking to get a
-          # self-contained binary that does not depend on the router's musl.
-          RUSTFLAGS: -C target-feature=+crt-static
+          # Two things have to be forced here:
+          # 1. mipsel-unknown-linux-musl defaults to a *dynamic* PIE (its target
+          #    spec sets crt_static_default = false), so ask for crt-static to
+          #    get a self-contained binary.
+          # 2. musl targets use rustc's bundled `self-contained` crt objects +
+          #    libunwind when crt-static is on, but a Tier 3 target ships no such
+          #    directory (rust-lang/rust#120655). Disabling self-contained
+          #    linking lets the OpenWrt gcc provide crt1.o/crti.o and libc.a.
+          RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
         run: |
           set -euxo pipefail
           cargo +nightly build \
