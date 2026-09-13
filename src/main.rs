@@ -25,7 +25,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -220,20 +220,30 @@ fn check_addrs(args: &Args) -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
     } else {
         (vec![], vec![])
     };
+    // When interface discovery is unavailable, print the wildcard address itself.
+    let discovered = !ipv4_addrs.is_empty() || !ipv6_addrs.is_empty();
     for bind_addr in args.addrs.iter() {
         new_addrs.push(bind_addr.clone());
         match bind_addr {
             BindAddr::IpAddr(ip) => match &ip {
                 IpAddr::V4(_) => {
                     if ip.is_unspecified() {
-                        print_addrs.extend(ipv4_addrs.clone());
+                        if discovered {
+                            print_addrs.extend(ipv4_addrs.clone());
+                        } else {
+                            print_addrs.push(bind_addr.clone());
+                        }
                     } else {
                         print_addrs.push(bind_addr.clone());
                     }
                 }
                 IpAddr::V6(_) => {
                     if ip.is_unspecified() {
-                        print_addrs.extend(ipv6_addrs.clone());
+                        if discovered {
+                            print_addrs.extend(ipv6_addrs.clone());
+                        } else {
+                            print_addrs.push(bind_addr.clone());
+                        }
                     } else {
                         print_addrs.push(bind_addr.clone());
                     }
@@ -252,18 +262,44 @@ fn check_addrs(args: &Args) -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
 
 fn interface_addrs() -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
     let (mut ipv4_addrs, mut ipv6_addrs) = (vec![], vec![]);
-    let ifaces =
-        if_addrs::get_if_addrs().with_context(|| "Failed to get local interface addresses")?;
-    for iface in ifaces.into_iter() {
-        let ip = iface.ip();
-        if ip.is_ipv4() {
-            ipv4_addrs.push(BindAddr::IpAddr(ip))
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => {
+            for iface in ifaces.into_iter() {
+                let ip = iface.ip();
+                if ip.is_ipv4() {
+                    ipv4_addrs.push(BindAddr::IpAddr(ip))
+                }
+                if ip.is_ipv6() {
+                    ipv6_addrs.push(BindAddr::IpAddr(ip))
+                }
+            }
         }
-        if ip.is_ipv6() {
-            ipv6_addrs.push(BindAddr::IpAddr(ip))
+        Err(err) => {
+            // Android denies netlink route requests to app processes (Termux,
+            // targetSdk >= 30), so `getifaddrs` fails with EACCES. This lookup is
+            // only used to pretty-print the listening addresses, so degrade to a
+            // netlink-free best-effort guess instead of aborting.
+            warn!("Failed to get local interface addresses, {err}");
+            if let Some(ip) = primary_ipv4_addr() {
+                ipv4_addrs.push(BindAddr::IpAddr(ip));
+            }
         }
     }
     Ok((ipv4_addrs, ipv6_addrs))
+}
+
+/// Guess the primary local IPv4 address without relying on netlink.
+///
+/// Connecting a UDP socket sends no packet but makes the kernel pick the source
+/// address of the route to `192.0.2.1` (TEST-NET-1), which works in sandboxes
+/// where `getifaddrs` is denied.
+fn primary_ipv4_addr() -> Option<IpAddr> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("192.0.2.1", 53)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Some(IpAddr::V4(ip)),
+        _ => None,
+    }
 }
 
 fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
